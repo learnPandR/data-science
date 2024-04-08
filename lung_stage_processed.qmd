@@ -1,0 +1,347 @@
+---
+title: "lung_stage_processed"
+author: "me"
+format: html
+html:
+  code_fold: true
+  code_tools: true
+editor: visual
+---
+
+###先对lung cancer分阶段进行处理
+
++--------------+--------------+--------------+--------------+
+| ```          | ```          | ```          | ```          |
+| l            | ll           | lll          | lV           |
+| ```          | ```          | ```          | ```          |
++==============+==============+==============+==============+
+| 225          | 590          | 153          | 32           |
++--------------+--------------+--------------+--------------+
+
+: NSCLC stage
+
+```{r}
+load(file = "lung_cancer_exp_and_clinical_group.Rdata")    
+#移除all_lung_cancer_clinical_group中stage_event列中的NA
+all_lung_caner_clinical_group <- all_lung_caner_clinical_group[!is.na(all_lung_caner_clinical_group$stage_event),]
+#按stage_event提取all_lung_cancer_clinical_group的行
+#
+lung_stage_I <- all_lung_caner_clinical_group[all_lung_caner_clinical_group$stage_event == "l",]
+lung_stage_II <- all_lung_caner_clinical_group[all_lung_caner_clinical_group$stage_event == "ll",]
+lung_stage_III <- all_lung_caner_clinical_group[all_lung_caner_clinical_group$stage_event == "lll",]
+lung_stage_IV <- all_lung_caner_clinical_group[all_lung_caner_clinical_group$stage_event == "lV",]
+#根据各阶段的表型TCGAID按列从lung_cancer_exp提取
+lung_stage_I_exp <- lung_cancer_exp[,lung_stage_I$TCGAID]
+lung_stage_II_exp <- lung_cancer_exp[,lung_stage_II$TCGAID]
+lung_stage_III_exp <- lung_cancer_exp[,lung_stage_III$TCGAID]
+lung_stage_IV_exp <- lung_cancer_exp[,lung_stage_IV$TCGAID]
+save(lung_stage_I_exp,lung_stage_II_exp,lung_stage_III_exp,lung_stage_IV_exp, normal_lung_exp,file = "lung_stage_exp.Rdata")
+save(lung_stage_I,lung_stage_II,lung_stage_III,lung_stage_IV, normal_lung_clinical_group,file = "lung_stage_clinical.Rdata")
+#癌旁组织的分阶段有一些NA，但不要紧，因为只要知道是癌旁正常组织即可
+```
+
+###构建计算相关性系数并筛选得到相应的差异网络基因的函数 ppi_NA是score为750以上的蛋白质网络
+
+```{r}
+process_data_to_gene_net <- function(exp, cor_method, cor_cut, ppi_NA) {
+  library(dplyr)
+  library(tidyverse)
+  library(Matrix)
+  
+  exp_d <- t(exp)
+  write.table(exp_d, file = "exp_d.csv", quote = FALSE, sep = ",")
+  exp_d_cor <- read.csv("exp_d.csv", header = TRUE, stringsAsFactors = FALSE)
+  
+  cor_exp <- cor(exp_d_cor, method = cor_method)
+  cor_exp[lower.tri(cor_exp)] <- 0
+  cor_exp[lower.tri(cor_exp, diag = TRUE)] <- 0
+  cor_exp <- abs(cor_exp)
+  
+  select_cor_exp <- (cor_exp > cor_cut) * cor_exp
+  write.table(select_cor_exp, file = "select_cor_exp.csv")
+  write.table(cor_exp, file = "cor_exp.csv")
+  
+  Tlist_cor_exp <- as.data.frame(summary(Matrix(select_cor_exp)))
+  
+  genename_exp <- data.frame(genename1 = colnames(select_cor_exp),
+                             genename2 = rownames(select_cor_exp),
+                             number = 1:ncol(select_cor_exp))
+  
+  Tlist_cor_exp$i <- genename_exp[match(Tlist_cor_exp$i, genename_exp$number), 2]
+  Tlist_cor_exp$j <- genename_exp[match(Tlist_cor_exp$j, genename_exp$number), 2]
+  
+  gene_net <- Tlist_cor_exp[, -3]
+  colnames(gene_net) <- c("protein1", "protein2")
+  
+  ppin <- intersect(gene_net, ppi_NA)
+  write.table(ppin, file = "ppin.csv")
+  
+  return(ppin)
+}
+```
+
+```{r}
+#读取ppi_NA.csv文件
+ppi_NA <- read.csv("ppi_NA.csv", header = TRUE, stringsAsFactors = FALSE)
+```
+
+###计算各阶段的差异基因
+
+```{r}
+stage_I_gene_net <- process_data_to_gene_net(lung_stage_I_exp, "spearman", 0.8, ppi_NA)
+stage_II_gene_net <- process_data_to_gene_net(lung_stage_II_exp, "spearman", 0.8, ppi_NA)
+stage_III_gene_net <- process_data_to_gene_net(lung_stage_III_exp, "spearman", 0.8, ppi_NA)
+stage_IV_gene_net <- process_data_to_gene_net(lung_stage_IV_exp, "spearman", 0.8, ppi_NA)
+normal_gene_net <- process_data_to_gene_net(normal_lung_exp, "spearman", 0.8, ppi_NA)
+save(stage_I_gene_net, stage_II_gene_net, stage_III_gene_net, stage_IV_gene_net, normal_gene_net, file = "lung_stage_gene_net.Rdata")
+```
+
+##移除在正常和癌组织中都存在的PPI，得到特异的PPI 并获得在每一个阶段正常和癌组织中都存在的特异PPI的基因，下面是这个函数
+
+```{r}
+disease_related_stage_gene <- function(ppin1, ppin2) {
+  specific_ppin1 <- dplyr::setdiff(ppin1, ppin2)
+  specific_ppin2 <- dplyr::setdiff(ppin2, ppin1)
+  a <- c(specific_ppin1[, 1], specific_ppin1[, 2])
+  b <- c(specific_ppin2[, 1], specific_ppin2[, 2])
+  common_gene <- unique(intersect(a, b))
+  return(common_gene)
+}
+```
+
+```{r}
+load(file = "lung_stage_gene_net.Rdata")
+stage_I_related_gene <- disease_related_stage_gene(stage_I_gene_net, normal_gene_net)
+stage_II_related_gene <- disease_related_stage_gene(stage_II_gene_net, normal_gene_net)
+stage_III_related_gene <- disease_related_stage_gene(stage_III_gene_net, normal_gene_net)
+stage_IV_related_gene <- disease_related_stage_gene(stage_IV_gene_net, normal_gene_net)
+```
+
+| l   | II  | III | IV  |
+|-----|-----|-----|-----|
+| 155 | 189 | 219 | 459 |
+
+: number of disease related genes in every phase
+
+##取在各阶段都存在的特异PPI的基因,得到candidate_gene
+
+```{r}
+list_of_stage_genes <- list(stage_I_related_gene, stage_II_related_gene, stage_III_related_gene, stage_IV_related_gene)
+candidate_gene <- Reduce(intersect, list_of_stage_genes)
+save(candidate_gene, file = "candidate_gene.Rdata")
+write.table(candidate_gene, file = "candidate_gene.csv", quote = FALSE, sep = ",")
+```
+
+###PCA分析查看肿瘤与组间是否分开, 最好使用DESeq2标准化后的矩阵进行PCA分析
+
+```{r}
+library(FactoMineR)
+library(factoextra)
+library(stringr)
+lung_normal_cancer_exp <- cbind(lung_cancer_exp, normal_lung_exp)
+#用candidate_gene按行取lung_normal_cancer_exp
+lung_candidate_exp <- lung_normal_cancer_exp[candidate_gene, ]
+# 确保 lung_normal_cancer_exp 只包含数值型数据
+# 假设 lung_normal_cancer_exp 是你的数据框
+# 转换数据框中的所有元素为数值类型，同时保留行名和列名
+#这里可分别做整体的PCA以及取了candidate_gene的PCA
+lung_normal_cancer_exp_numeric <- data.frame(apply(lung_candidate_exp, 2, function(x) as.numeric(as.character(x))), row.names = rownames(lung_candidate_exp))
+
+# 保留原始列名
+colnames(lung_normal_cancer_exp_numeric) <- colnames(lung_candidate_exp)
+
+
+# 如果 lung_normal_cancer_exp 包含非数值型数据列，需要先处理这些列
+
+pca_TCGA_lung_normal_cancer_exp <- as.data.frame(t(log(lung_normal_cancer_exp_numeric + 1)))
+group <- ifelse(as.numeric(str_sub(row.names(pca_TCGA_lung_normal_cancer_exp), 14, 15)) <= 10, "tumor", "normal")
+pca_TCGA_lung <- prcomp(pca_TCGA_lung_normal_cancer_exp)
+#PCA可视化
+fviz_pca_ind(pca_TCGA_lung, 
+             mean.point = F,#去除分组中心点
+             label = "none", #去除每一个样本的标签
+             col.ind = group, #按照分组着色
+             legend.title = "Group",
+             palette = c("#00AFBB", "#E7B800"), 
+             addEllipses = TRUE)#添加边界线，默认椭圆
+#三维可视化
+library(plotly)
+pcascore <- data.frame(pca_TCGA_lung$x[, 1:3])
+colnames(pcascore) <- c("PC1", "PC2", "PC3")
+pcascore$Group <- group
+plot_ly(data = pcascore, x = ~PC1, y = ~PC2, z = ~PC3, color = ~Group, type = "scatter3d", mode = "markers", marker = list(size = 5,opacity = 0.8)) %>%
+  layout(title = "3D Scatter Plot of PCA Results",
+         scene = list(xaxis = list(title = "PC1"),
+                      yaxis = list(title = "PC2"),
+                      zaxis = list(title = "PC3")))
+summary(pca_TCGA_lung)
+```
+
+
+
+从PCA降维分析结果看出，肿瘤和癌旁正常组间重叠较多， 而用candidate_gene取的PCA结果显示肿瘤和癌旁正常组间分开较多，说明candidate_gene的PCA结果能区分肿瘤和癌旁正常组间的差异。
+
+###获得差异表达基因
+
+```{r}
+load(file = "lung_cancer_exp_and_clinical_group.Rdata")
+lung_normal_cancer_exp <- cbind(lung_cancer_exp, normal_lung_exp)
+lung_dds_exp_numeric <- data.frame(apply(lung_normal_cancer_exp, 2, function(x) as.integer(as.numeric(as.character(x)))), row.names = rownames(lung_normal_cancer_exp))
+# 保留原始列名
+colnames(lung_dds_exp_numeric) <- colnames(lung_normal_cancer_exp)
+
+metadata <- data.frame(TCGA_id = colnames(lung_dds_exp_numeric), sample = as.factor(ifelse(as.numeric(str_sub(colnames(lung_dds_exp_numeric), 14, 15)) <= 10, "tumor", "normal")))
+sample <- metadata$sample
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(countData = lung_dds_exp_numeric,
+                              colData = metadata,
+                              design = ~ sample,
+                              tidy = FALSE)
+
+plotCounts(dds, gene = "PLK1", intgroup = "sample")
+
+```
+
+```{r}
+sample <- metadata$sample
+dds <- DESeq(dds)
+plotDispEsts(dds)
+res <- results(dds, contrast = c("sample", "tumor", "normal"), pAdjustMethod = "fdr", alpha = 0.05)
+resOrdered <- res[order(res$padj), ]
+DEG <- as.data.frame(resOrdered)
+DEG_lung_deseq2 <- na.omit(DEG)
+save(DEG_lung_deseq2, file = "DEG_deseq2.Rdata")
+
+```
+
+###筛选差异表达基因 构建筛选函数
+
+```{r}
+deg_filter <- function(df){
+  rownames(df)[df$change != "stable"]
+}#把stable过滤掉
+
+select_DEGs <- function(df_deseq2, Pvalue, logFC) {
+  # 标记差异表达基因为上调、下调或稳定
+  library(dplyr)
+  k1 <- (df_deseq2$padj < Pvalue) & (df_deseq2$log2FoldChange < -logFC)
+  k2 <- (df_deseq2$padj < Pvalue) & (df_deseq2$log2FoldChange > logFC)
+  lung_deseq2 <- dplyr::mutate(df_deseq2, change = ifelse(k1, "down", ifelse(k2, "up", "stable")))
+  
+  # 筛选出差异表达基因（非"stable"）
+  degs <- deg_filter(lung_deseq2)
+  
+  return(degs)
+}
+
+```
+
+```{r}
+#筛选lung
+load(file = "DEG_deseq2.RData")
+degs <- select_DEGs(DEG_lung_deseq2, 0.05, 1)#log2FC>1，padj<0.05
+save(degs, file = "degs_lung.RData")
+write.table(degs, file = "degs_NSCLC.csv", quote = FALSE, sep = ",")
+
+```
+
+###构建画PCA图的函数
+
+```{r}
+process_and_visualize_pca <- function(select_exp) {
+  library(FactoMineR)
+  library(factoextra)
+  library(stringr)
+  
+  # 转换为数值型，保留行名和列名
+  lung_normal_cancer_exp_numeric <- data.frame(
+    apply(select_exp, 2, function(x) as.numeric(as.character(x))),
+    row.names = rownames(select_exp)
+  )
+  colnames(lung_normal_cancer_exp_numeric) <- colnames(select_exp)
+  
+  # 应用对数转换
+  pca_TCGA_lung_normal_cancer_exp <- as.data.frame(t(log(lung_normal_cancer_exp_numeric + 1)))
+  
+  # 生成分组变量
+  group <- ifelse(as.numeric(substr(row.names(pca_TCGA_lung_normal_cancer_exp), 14, 15)) <= 10, "tumor", "normal")
+  
+  # 执行PCA
+  pca_TCGA_lung <- prcomp(pca_TCGA_lung_normal_cancer_exp)
+  
+  # PCA可视化
+  fviz_pca_ind(pca_TCGA_lung, 
+               mean.point = FALSE, # 去除分组中心点
+               label = "none",     # 去除每一个样本的标签
+               col.ind = group,    # 按照分组着色
+               legend.title = "Group",
+               palette = c("#00AFBB", "#E7B800"), 
+               addEllipses = TRUE) # 添加边界线，默认椭圆
+}
+
+```
+
+###画差异表达基因的PCA图
+
+```{r}
+load(file = "lung_cancer_exp_and_clinical_group.Rdata")    
+lung_normal_cancer_exp <- cbind(lung_cancer_exp, normal_lung_exp)
+#用candidate_gene按行取lung_normal_cancer_exp
+lung_degs_exp <- lung_normal_cancer_exp[degs, ]
+process_and_visualize_pca(lung_degs_exp)
+
+
+```
+
+###画所有基因的PCA图
+
+```{r}
+process_and_visualize_pca(lung_normal_cancer_exp)
+
+```
+
+###画将candidate_gene标注到差异基因上的火山图
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tibble)
+data <- DEG_lung_deseq2
+data$change <- as.factor(ifelse(data$padj<0.05 & abs(data$log2FoldChange)>1, ifelse(data$log2FoldChange>1, "up", "down"), "stable"))
+genelist = cbind(candidate_gene, candidate_gene)
+colnames(genelist) <- c("gene", "genelist")
+genelist <- as.data.frame(genelist)
+data_with_gene <- data %>% 
+  rownames_to_column(var = "gene")
+data2 <- left_join(data_with_gene,genelist, by = "gene")
+
+library(ggrepel)
+ggplot(data = data2, aes(x = log2FoldChange, y = -log10(padj), color = change)) + 
+  geom_point(alpha = 0.8) + 
+  theme_bw(base_size = 15) + 
+  theme(panel.grid.minor = element_blank(), panel.grid.major = element_blank()) + 
+  geom_hline(yintercept = 2, linetype = 4) + 
+  scale_color_manual(name = "", values = c("red", "green", "black"), limits = c("up", "down", "stable")) + 
+  geom_label_repel(aes(label = ifelse(change %in% c("up", "down"), as.character(genelist), NA)), 
+                   size = 2,
+                   max.overlaps = Inf, 
+                   nudge_x = 0, nudge_y = 0,
+                   fontface = "bold", color = "grey50", 
+                   box.padding = unit(0.2, "lines"), 
+                   point.padding = unit(0.3, "lines"), 
+                   segment.color = "grey50")
+```
+
+目前获得的初步候选基因数
+
+| candidate_gene | degs | 二者交集 |
+|----------------|------|----------|
+| 86             | 6268 | 64       |
+
+: preliminary select gene
+
+```{r}
+
+
+
+```
