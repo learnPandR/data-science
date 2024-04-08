@@ -1,0 +1,348 @@
+---
+title: "lasso and lasso cox"
+author: "me"
+format: html
+editor: visual
+---
+
+### 机器学习
+
+先用Lasso回归筛选与生存相关的基因，再用随机森林进行生存预测，再用SVM进行分类评价，并用测试集进行验证
+
+```{r 加载训练模型的生存和表达数据}
+load(file = "D:/lung stage processed/WGCNA/survival_analysis_clinical.RData")
+load(file = "D:/lung stage processed/normalized_lung_cancer_normal_exp_and_clinical.RData")
+```
+
+```{r 加载训练用特征集}
+load(file = "D:/lung stage processed/lung_mutation/further_candidate_gene.RData")
+```
+
+```{r 处理训练集数据}
+library(dplyr)
+#将数据框survivial_time_clinical中group_list列为tumor的数据提取出来
+lung_cancer_clinical <- subset(survival_time_clinical, group_list == "tumor")
+
+# #要把临床数据里的vital_status转化为因子变量
+# lung_cancer_clinical$vital_status <- as.factor(lung_cancer_clinical$vital_status)
+
+#按照lung_cancer_clinical的TCGAID列，把normalized_lung_exp中的表达数据提取出来(共1024个样本)
+normalized_lung_cancer_exp <- normalized_lung_exp[, lung_cancer_clinical$TCGAID]
+#按further_candidate_gene中的基因名，把normalized_lung_cancer_exp中的表达数据提取出来(列有97个特征)
+normalized_further_candidate_cancer_exp <- normalized_lung_cancer_exp[further_candidate_gene, ]
+
+#把临床数据的生死状态改为数值型
+lung_cancer_clinical$vital_status[lung_cancer_clinical$vital_status == "Alive"] <- "0"
+lung_cancer_clinical$vital_status[lung_cancer_clinical$vital_status == "Dead"] <- "1"
+lung_cancer_clinical$vital_status <- as.numeric(lung_cancer_clinical$vital_status)
+```
+"dead" 编码为 1（事件发生），"alive" 编码为 0（事件未发生），筛选出的基因可能与增加死亡风险有关。
+"alive" 编码为 1（事件发生），"dead" 编码为 0（事件未发生），筛选出的基因可能与生存（即不发生死亡事件）的概率有关。
+
+Lasso回归通过惩罚项推动系数向零收缩，来确定那些对预测响应变量最重要的预测变量（基因）。响应变量的编码方式（"dead" 是 0 还是 1）确实会改变模型系数的符号（正或负），但不会改变哪些变量是重要的这一事实。因为Lasso回归在选择变量时只关注变量系数的大小，而不关注符号。
+
+所以，不论 "dead" 是被编码为 0 还是 1，Lasso回归都会识别出同样的基因集作为与响应变量（生存状态）相关的重要预测变量。不过，系数的符号会反映出这些基因与生存状态是正相关还是负相关。例如：
+
+如果 "dead" 编码为 1，那么正系数表示基因表达水平的增加与死亡风险增加有关，而负系数则表示基因表达水平的增加与生存概率增加有关。
+如果 "alive" 编码为 1，那么正系数表示基因表达水平的增加与生存概率增加有关，而负系数则表示基因表达水平的增加与死亡风险增加有关。
+Lasso回归确定的重要性预测变量集不会因响应变量的不同编码而改变，但系数的解释和相关性的方向需要基于响应变量的编码来确定。在进行模型解释和生物学意义的推断时，这一点是非常重要的。
+
+| Alive | Dead |
+|-------|------|
+| 741   | 283  |
+
+: TCGA的lung_cancer_clinical生死患者数
+
+## Lasso回归和Ridge回归
+
+L1正则化通过向模型的损失函数添加所有系数的绝对值之和的项来实现正则化。 λ 是正则化强度的参数。 L1正则化的关键特性包括： 稀疏性：L1正则化倾向于产生稀疏解，即很多系数会被压缩为0。这意味着L1正则化可以用于特征选择，通过消除不重要的特征（系数为0）简化模型。 非平滑性：L1正则化的绝对值项在系数为0时不可微分，这在优化过程中需要特别处理。
+
+L2正则化通过向模型的损失函数添加所有系数的平方和的项来实现正则化。 非稀疏性：L2正则化倾向于将系数均匀压缩到较小的值，而不是将它们完全压缩到0。这意味着所有的特征都会被保留在模型中，但是特征的影响会被缩减。 平滑性：L2正则化的平方项在所有点上都是可微分的，这使得L2正则化更易于在数学上处理和优化。
+
+因此 先用L1正则化筛选特征，L1正则化将不重要的特征系数缩小到0，只保留重要的特征系数 再用L2正则化防止过拟合，使用L1筛选的特征子集使用L2训练另一个模型，将通过L2正则化得到的模型应用到验证集上，评估模型的预测性能。这一步骤是检验模型泛化能力的关键，可以使用各种评估指标（如准确率、ROC曲线、均方误差等）来衡量模型在验证集上的表现。
+
+
+##清洗临床特征，删除生存时间为负和为NA的样本
+```{r 清洗临床里生存时间的列}
+#查看为生存时间为负的情况
+summary(lung_cancer_clinical$survival_time)
+table(lung_cancer_clinical$survival_time < 0)
+
+#使得survival_time列中为na的行删除
+library(dplyr)
+clean_lung_survival_clinical <- lung_cancer_clinical %>%
+  filter(!is.na(survival_time))
+dim(clean_lung_survival_clinical) #1024个样本剩余993个样本
+clean_lung_survival_clinical <- clean_lung_survival_clinical[clean_lung_survival_clinical$survival_time > 0, ]
+#删除生存时间为负的样本后余958个样本
+#对表达矩阵也进行清洗
+clean_normalized_further_candidate_lung_exp <- normalized_further_candidate_cancer_exp[,clean_lung_survival_clinical$TCGAID]
+x_clean_exp <- t(clean_normalized_further_candidate_lung_exp)
+
+clean_normalized_lung_cancer_exp <- normalized_lung_cancer_exp[,clean_lung_survival_clinical$TCGAID]#包含19938个基因，958个患者
+
+save(clean_lung_survival_clinical, x_clean_exp, clean_normalized_lung_cancer_exp, file = "clean_lung_survival_clinical_exp.RData")
+# 只有肿瘤患者的，因为TCGA的NSCLC正常样本为癌旁正常样本，所以患者重复不适于生存分析就全部删去
+# x_clean_exp为further_candidate_gene的表达矩阵
+# clean_normalized_lung_cancer_exp为lung_cancer所有基因的表达矩阵
+
+```
+
+
+##Lasso回归筛选与生存相关的基因 从97个further_candidate_gene筛选与生存相关的基因
+
+```{r L1正则化调优参数}
+library(glmnet)
+
+y_event <- clean_lung_survival_clinical$vital_status
+set.seed(123)
+L1_cv_fit <- cv.glmnet(x = x_clean_exp, y = y_event)  #cv.glmnet()函数用于交叉验证L1正则化的强度参数λ
+plot(L1_cv_fit)#λ值代表了模型所使用的基因数
+```
+
+两条虚线分别指示两个最佳的λ值 MSE（均方误差）的宽度实际上代表了交叉验证过程中MSE估计的变异性或不确定性。宽度减小意味着随着Log(λ)值的变化，模型的预测性能（MSE）的变异性减少。具体来说：
+
+灰色误差带宽度：图中灰色的区域显示了在不同的λ值下，通过交叉验证计算出的MSE的置信区间。误差带的宽度表示了这些MSE估计的可靠性。宽度较宽表示较大的变异性，即模型的性能在不同的交叉验证折叠（folds）上有较大的波动。宽度较窄表明模型在各个交叉验证折叠上表现更加一致。
+
+高λ值（正则化强度）：当你向右移动到更高的λ值时，也就是Log(λ)值变大时，模型变得更简单，因为高的正则化强度会减少模型中非零系数的数量。这通常会导致在验证集上有更一致（但可能整体较高）的误差，因此误差带会变窄。
+
+低λ值（正则化强度）：在左侧，当λ值较低时，模型变得更复杂，可以包含更多的非零系数。在这种情况下，模型在拟合训练数据上可能表现得更好，但在交叉验证折叠上可能会表现出更大的性能波动，这会导致误差带变宽。
+
+总的来说，MSE宽度的减少表明了随着模型简化
+
+那么Log(λ)值选择-6，-5，-4都可以试试看
+
+```{r 系数图}
+fit_L1 <- glmnet(x = x_clean_exp, y = y_event)#glmnet构建模型
+plot(fit_L1, xvar = "lambda")
+
+```
+
+上图每一条线代表一个基因。横坐标是log Lambda,纵坐标是系数
+表示随着（惩罚值）Lambda增大，各变量（基因）的回归系数β逐渐减少，直至到0
+x轴上方为在该值下剩余的变量个数，在选中的lambda处画条直线，特征在线右侧，且lambda不为0的特征就是lasso筛选留下来的特征
+正的coefficient表明变量与高风险相关
+负的coefficient表明变量与低风险相关
+```{r 用lambda建模}
+#下面是筛选的lambda值
+# -3.987406   1.854777e-02      #lambda.min的值
+# -5.010777   6.665722e-03
+# -6.034148   2.395536e-03
+# 左边为Log的，右边为lambda值
+model_lasso_min <- glmnet(x = x_clean_exp, y = y_event, lambda = L1_cv_fit$lambda.min)
+
+gene_lasso_min <- rownames(model_lasso_min$beta)[as.numeric(model_lasso_min$beta) != 0]
+#as.numeric不等于0的基因就是有系数的，也就是被选中了的基因
+model_lasso_5 <- glmnet(x = x_clean_exp, y = y_event, lambda = 0.006665722)
+gene_lasso_5 <- rownames(model_lasso_5$beta)[as.numeric(model_lasso_5$beta) != 0]
+model_lasso_6 <- glmnet(x = x_clean_exp, y = y_event, lambda = 0.002395536)
+gene_lasso_6 <- rownames(model_lasso_6$beta)[as.numeric(model_lasso_6$beta) != 0]
+save(gene_lasso_min, gene_lasso_5, gene_lasso_6, file = "lasso_chose_gene.RData")
+```
+
+
+
+|                     | lasso min | lasso 5 | lasso 6 |
+|---------------------|-----------|---------|---------|
+| gene number         | 6         | 37      | 68      |
+| %in% candidate gene | 3         | 28      | 58      |
+
+: 不同lambda不同系数筛选出的基因数，依据生死（生1，死0），第二行是这些基因在candidate gene中的交集数量
+
+##绘制NSCLC的患者生存曲线
+```{r 绘制NSCLC的生存曲线}
+library(survival)
+library(survminer)
+survival_object <- Surv(time = clean_lung_survival_clinical$survival_time/365.25, event = clean_lung_survival_clinical$vital_status)
+surv_fit <- survfit(survival_object ~ 1)
+ggsurvplot(surv_fit, 
+           data = lung_cancer_clinical,
+           conf.int = TRUE,
+           xlab = "Time in years",
+           pval = TRUE,
+           risk.table = TRUE,
+           title = "Kaplan-Meier curve of lung cancer survival",
+           ggtheme = theme_minimal())
+```
+##Lasso Cox模型
+```{r 用生存时间和存活状态建立lasso cox模型}
+#cox模型里临床生存时间数据不能有负的、0、以及NA的值，必需清洗干净
+set.seed(123)
+y_survival_event <- Surv(time = clean_lung_survival_clinical$survival_time, event = clean_lung_survival_clinical$vital_status) 
+fit_L1_survival <- glmnet(x = x_clean_exp, y = y_survival_event, family = "cox", alpha = 1)
+plot(fit_L1_survival, xvar = "lambda")
+
+#默认是10这交叉验证
+L1_cv_cox_fit <- cv.glmnet(x = x_clean_exp, y = y_survival_event, family = "cox", alpha = 1)  #cv.glmnet()函数用于交叉验证L1正则化的强度参数λ
+# 在交叉验证中使用deviance(偏差)作为模型评估的损失函数，用于寻找能够最小化拟合模型偏差的模型参数如L1中的λ值。
+# 低偏差通常表示模型拟合数据较好
+plot(L1_cv_cox_fit)#λ值代表了模型所使用的基因数
+```
+上图选择参数的纵轴是偏似然偏差
+Lasso可以压缩不重要的变量的系数到0，从而自动选择对生存时间预测最重要的变量。这不仅可以提高模型的解释性，还可以帮助避免过拟合，提高模型的泛化能力。
+```{r 用lambda对生存时间建模，获得筛选出的基因}
+#下面是筛选的lambda值
+# -4.073398   0.0170194627     #lambda.min的值
+# -5.003735   0.0067128268
+# -6.027106   0.0024124649
+# 左边为Log的，右边为lambda值
+
+model_lasso_cox_4 <- glmnet(x = x_clean_exp, y = y_survival_event, alpha = 1, family = "cox", lambda = 0.0170194627)
+gene_lasso_cox_4 <- rownames(model_lasso_cox_4$beta)[as.numeric(model_lasso_cox_4$beta) != 0]
+
+model_lasso_cox_5 <- glmnet(x = x_clean_exp, y = y_survival_event, alpha = 1, family = "cox", lambda = 0.0067128268)
+gene_lasso_cox_5 <- rownames(model_lasso_cox_5$beta)[as.numeric(model_lasso_cox_5$beta) != 0]
+
+model_lasso_cox_6 <- glmnet(x = x_clean_exp, y = y_survival_event, alpha = 1, family = "cox", lambda = 0.0024124649)
+gene_lasso_cox_6 <- rownames(model_lasso_cox_6$beta)[as.numeric(model_lasso_cox_6$beta) != 0]
+
+save(gene_lasso_cox_4, gene_lasso_cox_5, gene_lasso_cox_6, file = "lasso_cox_chose_gene.RData")
+```
+在模型中保留下来的基因（即系数不为0的基因）被认为是对患者生存时间有显著影响的。
+对于每个被选中的基因，它的系数大小和符号可以提供以下信息：
+系数的符号：正系数意味着基因表达的增加与生存时间的延长相关联（即降低了死亡风险），而负系数意味着基因表达的增加与生存时间的缩短相关联（即增加了死亡风险）。
+系数的大小：系数的绝对值越大，表明该基因对患者生存时间的影响越显著。
+
+
+
+##查看lasso筛选的基因与candidate gene的重叠情况，并看不同lambda的重叠是否相同
+```{r  查看在lasso筛选的基因与candidate gene的重叠情况}
+load(file = "D:/lung stage processed/candidate_gene.Rdata")
+not_in_candidate_6 <- !gene_lasso_6 %in% candidate_gene
+not_in_candidate_5 <- !gene_lasso_5 %in% candidate_gene
+
+# 提取这些基因
+genes_not_in_candidate_6 <- gene_lasso_6[not_in_candidate_6]
+genes_not_in_candidate_5 <- gene_lasso_5[not_in_candidate_5]
+
+# 比较这两组基因，找出在两组中均不匹配的基因
+common_not_in_candidates <- intersect(genes_not_in_candidate_6, genes_not_in_candidate_5)
+
+# 打印结果
+print(common_not_in_candidates)
+```
+
+```{r KEGG富集分析}
+library(tidyverse)
+library(data.table)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+
+entrezid_lung <- mapIds(x = org.Hs.eg.db, 
+                       keys = gene_lasso_cox_5, 
+                       column = "ENTREZID", 
+                       keytype = "SYMBOL")
+KEGG_enrich_lung <- enrichKEGG(
+  gene = entrezid_lung, 
+  keyType = "kegg", 
+  organism = "hsa", 
+  pvalueCutoff = 0.5, 
+  pAdjustMethod = "fdr", 
+  qvalueCutoff =0.5, ) 
+KEGG_enrich_lung <- data.frame(KEGG_enrich_lung)
+
+KEGG_enrich_lung_filter <- subset(KEGG_enrich_lung, pvalue < 0.05)
+p <- ggplot(KEGG_enrich_lung_filter,
+       aes(x = GeneRatio, y = Description)) + 
+  geom_point(aes(size = Count, color = -1*log10(pvalue))) + 
+  scale_color_gradient(low = "blue", high = "red") + 
+  labs(color = expression(-log[10](pvalue)), size = "Gene number", x = "Gene Ratio", y = "KEGG pathway", title = "lasso cox chose gene KEGG enrichment analysis") + 
+  theme_bw() + 
+  theme(axis.text.y = element_text(size = (10)),
+        axis.text.x = element_text(size = (8)),
+        axis.title.y = element_blank())
+
+ggsave("D:/lung stage processed/machine_learning/KEGG_enrich_lung_lasso_cox_5.png", plot = p, width = 8, height = 8, dpi = 400)
+```
+
+
+```{r}
+gene_lasso_cox_5_exp <- data.frame(OS = clean_lung_survival_clinical$vital_status, OS.time = clean_lung_survival_clinical$survival_time, gene_lasso_cox_exp)
+gene_lasso_cox_exp <- x_clean_exp[, gene_lasso_cox_5] #行为样本，列为基因
+cox_model_lasso_cox_5 <- coxph(Surv(clean_lung_survival_clinical$survival_time, clean_lung_survival_clinical$vital_status) ~ ., data = data.frame(OS = clean_lung_survival_clinical$vital_status, OS.time = clean_lung_survival_clinical$survival_time, gene_lasso_cox_exp), control = coxph.control(iter.max = 1000))
+summary(cox_model_lasso_cox_5)
+```
+
+```{r 计算风险评分}
+risk_score_lasso_cox_5 <- predict(cox_model_lasso_cox_5, newdata = gene_lasso_cox_5_exp, type = "risk")
+risk_score_lasso_cox_5 <- as.data.frame(risk_score_lasso_cox_5)
+risk_score_lasso_cox_5$TCGAID <- rownames(risk_score_lasso_cox_5)
+head(risk_score_lasso_cox_5)
+```
+
+```{r 画生存曲线}
+riskscore_lasso_cox_5_cli <- risk_score_lasso_cox_5 %>% inner_join(clean_lung_survival_clinical)
+riskscore_lasso_cox_5_cli$riskscore_class <- ifelse(riskscore_lasso_cox_5_cli$risk_score_lasso_cox_5 > median(riskscore_lasso_cox_5_cli$risk_score_lasso_cox_5), "high", "low")
+
+#KM分析
+fit_lasso_cox_5 <- survfit(Surv(clean_lung_survival_clinical$survival_time, as.numeric(clean_lung_survival_clinical$vital_status)) ~ riskscore_class, data = riskscore_lasso_cox_5_cli)
+
+lasso_cox_5_KM <- ggsurvplot(fit_lasso_cox_5, 
+                             data = riskscore_lasso_cox_5_cli, 
+                             pval = TRUE, 
+                             conf.int = TRUE, # Add confidence interval
+                             risk.table = TRUE, 
+                             legend.title = "Risk score", 
+                             legend.labs = c("Low", "High"), 
+                             title = "Over survivial",
+                             xlab = "Time (days)", 
+                             ylab = "Survival probability", 
+                             surv.median.line = "hv", 
+                             ggtheme = theme_minimal(), 
+                             palette = c("blue", "red"),
+                             break.x.by = 365)
+lasso_cox_5_KM
+```
+
+```{r}
+library(caret)
+library(glmnet)
+set.seed(123)
+#提取表达矩阵
+lasso_cox_5_exp <- normalized_lung_exp[gene_lasso_cox_5,]
+#设置分组，提取TCGA列名，并按照14，15位的值小于10则为正常值
+group <- ifelse(as.numeric(str_sub(colnames(lasso_cox_5_exp), 14, 15)) <= 10, "1", "0")
+group <- factor(group, levels = c("1", "0"))
+group_infor <- data.frame(TCGAID = colnames(lasso_cox_5_exp), Group = group)
+
+trainindex <- createDataPartition(group_infor$Group, p = 0.6, list = FALSE, times = 1)
+lasso_cox_5_exp_t <- t(lasso_cox_5_exp)
+train_data <- lasso_cox_5_exp_t[trainindex, ]
+test_data <- lasso_cox_5_exp_t[-trainindex, ]
+
+train_labels <- group_infor$Group[trainindex]
+test_labels <- group_infor$Group[-trainindex]
+
+cv_fit_L2 <- cv.glmnet(x = train_data, y = train_labels, alpha = 0, family = "binomial", type.measure = "class")
+best_lambda_L2 <- cv_fit_L2$lambda.min
+ridge_model <- glmnet(x = train_data, y = train_labels, alpha = 0, family = "binomial", lambda = best_lambda_L2)
+
+predictions_L2 <- predict(ridge_model, newx = test_data, s = "lambda.min", type = "response")
+prediction_classes <- ifelse(predictions_L2 > 0.5, "1", "0")
+
+levels_all <- union(levels(factor(test_labels)), levels(factor(prediction_classes)))
+class_labels_factor <- factor(test_labels, levels = levels_all)
+predicted_labels_factor <- factor(prediction_classes, levels = levels_all)
+confusionMatrix(predicted_labels_factor, class_labels_factor)
+```
+
+
+```{r}
+library(e1071)
+tune_result <- tune(svm, train_data, train_labels, kernel = "radial", ranges = list(cost = c(0.1, 1, 10, 100, 1000), gamma = c(0.5, 1, 2, 3, 4)/nrow(train_data)))
+svm_model_rbf <- svm(train_data, train_labels, kernel = "radial", cost = tune_result$best.parameters$cost, gamma = tune_result$best.parameters$gamma)
+
+predictions_rbf <- predict(svm_model_rbf, test_data)
+confusionMatrix(predictions_rbf, test_labels)
+```
+
+```{r}
+load(file = "D:/LUAD LUSC/test_exp_and_pdata.RData")
+select_gene_lasso_cox_5 <- gene_lasso_cox_5[gene_lasso_cox_5 %in% rownames(exp_GSE30219)]#36个
+```
+
+
+
+
+
